@@ -88,6 +88,16 @@ def _percentile_of_score(a, score, axis):
     return (a < score).sum(axis=axis) / B
 
 
+def _percentile_of_score_patch(a, score, axis):
+    """Vectorized, simplified `scipy.stats.percentileofscore`.
+
+    Unlike `stats.percentileofscore`, the percentile returned is a fraction
+    in [0, 1].
+    """
+    B = a.shape[axis]
+    return ((a < score).sum(axis=axis) + (a <= score).sum(axis=axis)) / (2 * B)
+
+
 def _percentile_along_axis(theta_hat_b, alpha):
     """`np.percentile` with different percentile for each slice."""
     # the difference between _percentile_along_axis and np.percentile is that
@@ -105,6 +115,37 @@ def _percentile_along_axis(theta_hat_b, alpha):
             theta_hat_b_i = theta_hat_b[indices]
             percentiles[indices] = np.percentile(theta_hat_b_i, alpha_i)
     return percentiles[()]  # return scalar instead of 0d array
+
+
+def _bca_interval_patch(data, statistic, axis, alpha, theta_hat_b, batch):
+    """Bias-corrected and accelerated interval."""
+    # closely follows [2] "BCa Bootstrap CIs"
+    sample = data[0]  # only works with 1 sample statistics right now
+
+    # calculate z0_hat
+    theta_hat = np.asarray(statistic(sample, axis=axis))[..., None]
+    percentile = _percentile_of_score_patch(theta_hat_b, theta_hat, axis=-1)
+    z0_hat = ndtri(percentile)
+
+    # calculate a_hat
+    theta_hat_i = []  # would be better to fill pre-allocated array
+    for jackknife_sample in _jackknife_resample(sample, batch):
+        theta_hat_i.append(statistic(jackknife_sample, axis=-1))
+    theta_hat_i = np.concatenate(theta_hat_i, axis=-1)
+    theta_hat_dot = theta_hat_i.mean(axis=-1, keepdims=True)
+    num = ((theta_hat_dot - theta_hat_i)**3).sum(axis=-1)
+    den = 6*((theta_hat_dot - theta_hat_i)**2).sum(axis=-1)**(3/2)
+    a_hat = num / den
+
+    # calculate alpha_1, alpha_2
+    z_alpha = ndtri(alpha)
+    z_1alpha = -z_alpha
+    num1 = z0_hat + z_alpha
+    alpha_1 = ndtr(z0_hat + num1/(1 - a_hat*num1))
+    num2 = z0_hat + z_1alpha
+    alpha_2 = ndtr(z0_hat + num2/(1 - a_hat*num2))
+    return alpha_1, alpha_2
+
 
 
 def _bca_interval(data, statistic, axis, alpha, theta_hat_b, batch):
@@ -201,7 +242,7 @@ def _bootstrap_iv(data, statistic, vectorized, paired, axis, confidence_level,
         if batch != batch_iv or batch_iv <= 0:
             raise ValueError("`batch` must be a positive integer or None.")
 
-    methods = {'percentile', 'basic', 'bca'}
+    methods = {'percentile', 'basic', 'bca', 'bca_patch'}
     method = method.lower()
     if method not in methods:
         raise ValueError(f"`method` must be in {methods}")
@@ -478,6 +519,10 @@ def bootstrap(data, statistic, *, n_resamples=9999, batch=None,
     alpha = (1 - confidence_level)/2
     if method == 'bca':
         interval = _bca_interval(data, statistic, axis=-1, alpha=alpha,
+                                 theta_hat_b=theta_hat_b, batch=batch)
+        percentile_fun = _percentile_along_axis
+    elif method == 'bca_patch':
+        interval = _bca_interval_patch(data, statistic, axis=-1, alpha=alpha,
                                  theta_hat_b=theta_hat_b, batch=batch)
         percentile_fun = _percentile_along_axis
     else:
